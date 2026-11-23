@@ -3,6 +3,7 @@
 ![OpenBSD 8.0](https://img.shields.io/badge/OpenBSD-8.0%20amd64-f2ca30)
 ![PocketBase v0.40.6](https://img.shields.io/badge/PocketBase-v0.40.6-b8dbe4)
 ![Go 1.27](https://img.shields.io/badge/Go-1.27-00add8)
+[![License: ISC](https://img.shields.io/badge/License-ISC-blue)](LICENSE)
 
 **Your own DNS and DHCP for a home network, on one small OpenBSD box.** It runs
 a validating resolver that answers from the root servers itself, keeps local
@@ -179,3 +180,7 @@ networks (RFC 8375), and the documentation addresses 192.0.2.0/24 (RFC 5737).
 - **The LAN scan sees only the LAN itself.** VMs behind another machine's
   NAT, and guest Wi-Fi the router keeps apart, don't show.
 - **Written and tested for OpenBSD 8.0 on amd64**, and for LANs from a /16 to a /29.
+
+## License
+
+[ISC](LICENSE), the license OpenBSD prefers for new code.

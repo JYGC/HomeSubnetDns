@@ -1,0 +1,17 @@
+#!/bin/sh
+# Print where the workstation scripts reach the box over SSH: RDOAS_HOST if it's
+# set, else BOX_USER@ADDRESS from site.conf (only ADDRESS if BOX_USER is empty,
+# so ~/.ssh/config or the local user name applies).
+# usage: scripts/box-host
+set -eu
+
+if [ -n "${RDOAS_HOST-}" ]; then
+	echo "$RDOAS_HOST"
+	exit 0
+fi
+conf=$(dirname "$0")/../site.conf
+[ -r "$conf" ] || { echo "no site.conf: copy site.conf.example to site.conf and fill it in (RUNBOOK.md §3)" >&2; exit 1; }
+address=$(sed -n 's/^ADDRESS=//p' "$conf")
+[ -n "$address" ] || { echo "site.conf has no ADDRESS (RUNBOOK.md §3)" >&2; exit 1; }
+user=$(sed -n 's/^BOX_USER=//p' "$conf")
+echo "${user:+$user@}$address"

@@ -1,0 +1,26 @@
+#!/bin/sh
+# Copy the box's data to this machine: PocketBase (host records, aliases, and
+# the device, admin and dnssync accounts) and the DHCP leases. The box's own
+# nightly backups are lost with it; with one of these, scripts/install-box
+# --restore rebuilds it as it was (RUNBOOK.md §5). PocketBase stops for a few
+# seconds; DNS doesn't. It also refreshes the installer bundle next to the
+# backups (scripts/bundle), so the two can be kept together off this machine.
+# usage: scripts/backup     (saves to $HSD_BACKUP_DIR, default ~/.local/share/homesubnetdns/backups)
+set -eu
+
+DIR=${HSD_BACKUP_DIR:-$HOME/.local/share/homesubnetdns/backups}
+cd "$(dirname "$0")/.."
+HOST=$(scripts/box-host)
+umask 077
+mkdir -p "$DIR"
+
+scripts/rdoas jobs/24-backup.sh
+out=$DIR/homesubnetdns-$(date +%Y%m%d-%H%M%S).tgz
+scp -q -o BatchMode=yes "$HOST:.rdoas/backup.tgz" "$out.part"
+ssh -o BatchMode=yes "$HOST" 'rm -f .rdoas/backup.tgz'
+tar -tzf "$out.part" | grep -qx 'pb_data/data.db' ||
+	{ echo "the copy has no pb_data/data.db: $out.part" >&2; exit 1; }
+mv "$out.part" "$out"
+echo "saved $out (restore with: scripts/install-box --restore $out)"
+scripts/bundle "$DIR/homesubnetdns-installer.tgz" ||
+	echo "warning: the backup is saved, but the installer bundle wasn't refreshed (run scripts/bundle)" >&2

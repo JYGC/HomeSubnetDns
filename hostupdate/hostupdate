@@ -1,0 +1,169 @@
+#!/bin/sh
+#
+# hostupdate: check in with the DNS box so <name>.<domain> follows this
+# device's IPv4 address (PLAN.md §9). The server records the request's source
+# address. Runs from cron (or a systemd timer) as an unprivileged user; set up
+# by install.sh. Deployed to /usr/local/libexec/hostupdate.
+#
+# usage: hostupdate [--boot | --info]
+#   --boot  retry every 15 s, for up to 5 minutes, until the server answers
+#   --info  print the box's domain= and reverse= lines (no login; install.sh)
+#
+# Config, /etc/hostupdate.conf (mode 0400, owned by the run-as user):
+#   name=nas
+#   password=<32 letters and digits>
+#   domain=home.arpa                     (set by install.sh; messages only)
+#   url=http://<box>:8090/api/hostupdate  (set by install.sh from --box)
+# HOSTUPDATE_URL overrides url= (install.sh asks --info before it writes it).
+
+set -u
+PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+CONF=${HOSTUPDATE_CONF:-/etc/hostupdate.conf}
+umask 077
+
+# Messages go to syslog, and to stderr as well when run from a terminal.
+log() {
+	logger -t hostupdate -p "user.$1" -- "$2" 2>/dev/null
+	[ -t 2 ] && printf 'hostupdate: %s\n' "$2" >&2
+	return 0
+}
+say() { [ -t 2 ] && printf 'hostupdate: %s\n' "$1" >&2; return 0; }
+die() { log err "$1"; exit 1; }
+
+mode=checkin
+case ${1-} in
+--boot) mode=boot ;;
+--info) mode=info ;;
+'') ;;
+*) echo "usage: hostupdate [--boot | --info]" >&2; exit 2 ;;
+esac
+
+name= password= domain= url=
+if [ -r "$CONF" ]; then
+	while IFS= read -r line || [ -n "$line" ]; do
+		case $line in
+		name=*) name=${line#name=} ;;
+		password=*) password=${line#password=} ;;
+		domain=*) domain=${line#domain=} ;;
+		url=*) url=${line#url=} ;;
+		esac
+	done <"$CONF"
+elif [ "$mode" != info ]; then
+	die "cannot read $CONF"
+fi
+url=${HOSTUPDATE_URL:-$url}
+[ -n "$url" ] || die "$CONF has no url=: run install.sh --box <the DNS box's address>"
+case $url in http://*) ;; *) die "$CONF: url must start with http://" ;; esac
+case $domain in *[!a-z0-9.-]*) domain= ;; esac
+fqdn=$name${domain:+.$domain}
+
+# Never pass a tool's stderr on: ftp(1) prints the URL, password included, in
+# its errors. Only the HTTP status code is taken from it.
+status_of() { sed -n 's/.* \([1-5][0-9][0-9]\) [A-Za-z].*/\1/p' "$1" | head -n 1; }
+code_reply() {
+	case $1 in
+	400) echo badip ;; 401) echo badauth ;; 409) echo conflict ;;
+	'') ;; *) echo error ;;
+	esac
+}
+
+# Pick the HTTP client once (D17/D19): curl and GNU wget keep the password out
+# of ps; the ftp(1) and BusyBox fallbacks put it in the URL for the request.
+# HOSTUPDATE_CLIENT=curl|gnuwget|ftp|bbwget|"busybox wget" forces one.
+client=${HOSTUPDATE_CLIENT-}
+if [ -n "$client" ]; then
+	:
+elif command -v curl >/dev/null 2>&1; then
+	client=curl
+elif wget --version 2>/dev/null | grep -q 'GNU Wget'; then
+	client=gnuwget
+elif [ "$(uname -s)" = OpenBSD ]; then
+	client=ftp
+elif wget --help 2>&1 | grep -q BusyBox; then
+	client=bbwget
+elif busybox wget --help >/dev/null 2>&1; then
+	client="busybox wget"
+else
+	die "no HTTP client: install curl or wget"
+fi
+
+# --info: the box's site settings, for install.sh. No login, so no secrets.
+if [ "$mode" = info ]; then
+	case $client in
+	curl) out=$(curl -s -f -m 20 "$url/info" 2>/dev/null) ;;
+	gnuwget) out=$(wget -q -O - -T 20 -t 1 "$url/info" 2>/dev/null) ;;
+	ftp) out=$(ftp -M -V -w 20 -o - "$url/info" 2>/dev/null) ;;
+	bbwget) out=$(wget -q -O - -T 20 "$url/info" 2>/dev/null) ;;
+	*) out=$(busybox wget -q -O - -T 20 "$url/info" 2>/dev/null) ;;
+	esac
+	out=$(printf '%s\n' "$out" | grep -E '^(domain|reverse)=[a-z0-9][a-z0-9.-]*$')
+	printf '%s\n' "$out" | grep -q '^domain=' || { echo "hostupdate: no site info from $url/info" >&2; exit 1; }
+	printf '%s\n' "$out"
+	exit 0
+fi
+
+# These end up inside a URL or a curl config string, so keep them plain.
+case $name in '' | *[!a-z0-9-]*) die "$CONF: name must be lowercase letters, digits and hyphens" ;; esac
+case $password in '' | *[!A-Za-z0-9]*) die "$CONF: password must be letters and digits only" ;; esac
+authurl="http://$name:$password@${url#http://}"
+
+# Print the server's reply line; print nothing if the server wasn't reached.
+request() {
+	tmp=$(mktemp) || return
+	case $client in
+	curl)
+		printf 'user = "%s:%s"\n' "$name" "$password" |
+			curl -s -m 20 -K - "$url" 2>/dev/null | head -n 1
+		;;
+	gnuwget)
+		printf 'http_user = %s\nhttp_password = %s\n' "$name" "$password" >"$tmp"
+		# Error bodies come through, except on a 401: then wget prints none and exits 6.
+		out=$(wget -q -O - -T 20 -t 1 --config="$tmp" --auth-no-challenge --content-on-error \
+			"$url" 2>/dev/null) || { [ $? -eq 6 ] && [ -z "$out" ] && out=badauth; }
+		[ -z "$out" ] || printf '%s\n' "$out" | head -n 1
+		;;
+	*)
+		# These print no body on an HTTP error, so map the status code instead.
+		case $client in
+		ftp) out=$(ftp -M -V -w 20 -o - "$authurl" 2>"$tmp") ;;
+		bbwget) out=$(wget -q -O - -T 20 "$authurl" 2>"$tmp") ;;
+		*) out=$(busybox wget -q -O - -T 20 "$authurl" 2>"$tmp") ;;
+		esac || out=$(code_reply "$(status_of "$tmp")")
+		[ -z "$out" ] || printf '%s\n' "$out" | head -n 1
+		;;
+	esac
+	rm -f "$tmp"
+}
+
+tries=1
+[ "$mode" = boot ] && tries=20
+while :; do
+	reply=$(request)
+	case $reply in
+	good\ *)
+		log info "$fqdn -> ${reply#good }"
+		exit 0
+		;;
+	nochg\ *)
+		say "$fqdn -> ${reply#nochg } (unchanged)"
+		exit 0
+		;;
+	badauth)
+		die "server rejected the name or password for '$name': check its devices record in PocketBase"
+		;;
+	badip*)
+		die "server says this device's source address${reply#badip} isn't a LAN client address"
+		;;
+	conflict*)
+		die "conflict${reply#conflict}: a hand-made record holds this device's address, or another record (a device's, or an alias) has its name; fix it in PocketBase"
+		;;
+	esac
+	tries=$((tries - 1))
+	if [ "$tries" -le 0 ]; then
+		if [ -n "$reply" ]; then
+			die "server error ($reply)"
+		fi
+		die "cannot reach $url"
+	fi
+	sleep 15
+done

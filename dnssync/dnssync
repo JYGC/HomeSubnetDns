@@ -1,0 +1,204 @@
+#!/usr/bin/perl
+#
+# dnssync: render PocketBase "hosts" records into an Unbound include file and
+# reload Unbound when the content changes. Runs from _dnssync's crontab.
+# Deployed to /usr/local/libexec/dnssync by the installer, which fills in
+# $DOMAIN and the box's address from site.conf.
+
+use strict;
+use warnings;
+
+use HTTP::Tiny;
+use JSON::PP;
+use Sys::Syslog qw(openlog syslog closelog);
+use OpenBSD::Pledge;
+
+my $API      = 'http://@ADDRESS@:8090/api';
+my $CREDS    = '/var/dnssync/.pbcreds';
+my $HOMED    = '/var/unbound/etc/home.d';
+my $STATIC   = "$HOMED/static.conf";
+my $OUT      = "$HOMED/pocketbase.conf";
+my $TMP      = "$HOMED/.pocketbase.tmp";	# must not match the *.conf include glob
+my $PREV     = "$HOMED/.pocketbase.prev";
+my $DOMAIN   = '@DOMAIN@';
+my $TTL      = 60;	# short, so the router's cache picks up edits quickly
+my $PER_PAGE = 500;
+
+my $LABEL   = qr/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?/;
+my $NAME_RE = qr/^$LABEL(?:\.$LABEL)*$/;	# e.g. nas, runtask.test.app (D30)
+my $IPV4_RE = qr/^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/;
+
+pledge(qw(rpath wpath cpath fattr inet dns proc exec)) or die "pledge: $!";
+openlog('dnssync', 'pid', 'daemon');
+umask 027;
+
+sub logmsg { syslog($_[0], '%s', $_[1]) }
+sub fail   { logmsg('err', $_[0]); closelog(); exit 1 }
+
+fail("DOMAIN '$DOMAIN' isn't a domain name; deploy dnssync with the installer")
+    unless $DOMAIN =~ $NAME_RE;
+
+sub slurp {
+	my ($path) = @_;
+	open(my $fh, '<', $path) or return undef;
+	local $/;
+	my $s = <$fh>;
+	close($fh);
+	return $s;
+}
+
+sub run_quiet {
+	my $pid = fork() // return -1;
+	if ($pid == 0) {
+		open(STDOUT, '>', '/dev/null');
+		open(STDERR, '>', '/dev/null');
+		exec(@_) or exit 127;
+	}
+	waitpid($pid, 0);
+	return $? >> 8;
+}
+
+# --- credentials
+my %cred;
+for (split /\n/, slurp($CREDS) // fail("cannot read $CREDS")) {
+	$cred{$1} = $2 if /^(\w+)=(.*)$/;
+}
+fail("$CREDS lacks email/password") unless $cred{email} && $cred{password};
+
+# --- names and PTR addresses owned by static.conf
+my (%reserved_name, %reserved_ptr);
+my $static = slurp($STATIC) // fail("cannot read $STATIC");
+$reserved_name{$1} = 1 while $static =~ /^\s*local-data:\s*"([a-z0-9-]+)\.\Q$DOMAIN\E\./mg;
+$reserved_ptr{$1}  = 1 while $static =~ /^\s*local-data-ptr:\s*"([0-9.]+)\s/mg;
+
+# --- fetch records
+my $http = HTTP::Tiny->new(timeout => 10, agent => 'dnssync/1');
+my $json = JSON::PP->new->utf8;
+
+my $res = $http->post("$API/collections/service_accounts/auth-with-password", {
+	headers => { 'Content-Type' => 'application/json' },
+	content => $json->encode({ identity => $cred{email}, password => $cred{password} }),
+});
+fail("auth failed: $res->{status} $res->{reason}") unless $res->{success};
+my $token = eval { $json->decode($res->{content})->{token} }
+    or fail('auth response has no token');
+
+# Records with an address. Device records (PLAN.md §9) drop out 24 h after the
+# last check-in, or when another device's check-in releases their IP.
+my $FILTER = 'disabled = false && ipv4 != "" && (device = "" || last_seen >= @yesterday)';
+# Aliases (D33), and aliases whose target was deleted (alias_of empty, D34).
+my $ALIAS_FILTER = 'disabled = false && device = "" && ipv4 = ""';
+# Both are checked against PocketBase by the Go tests; change them together.
+
+sub fetch {
+	my ($filter) = @_;
+	my @items;
+	for (my $page = 1; ; $page++) {
+		my $q = $http->www_form_urlencode({
+			page => $page, perPage => $PER_PAGE, skipTotal => 1,
+			sort => 'name', filter => $filter,
+		});
+		$res = $http->get("$API/collections/hosts/records?$q",
+		    { headers => { Authorization => $token } });
+		fail("fetch failed: $res->{status} $res->{reason}") unless $res->{success};
+		my $batch = eval { $json->decode($res->{content})->{items} };
+		fail('fetch response is not a record list') unless ref($batch) eq 'ARRAY';
+		push @items, @$batch;
+		last if @$batch < $PER_PAGE;
+	}
+	return @items;
+}
+my @items   = fetch($FILTER);
+my @aliases = fetch($ALIAS_FILTER);
+
+# --- render
+my (%seen_name, %seen_ptr, %ip_of, %ptr_name, %ptr_by, @a, @ptr_ids);
+my @skips;	# logged only when the file changes, so a persistent skip isn't logged every minute
+
+sub name_problem {
+	my ($name) = @_;
+	return 'invalid name' if $name !~ $NAME_RE;
+	return 'name too long' if length("$name.$DOMAIN") > 253;
+	# Names under a reserved one (www.router) are refused too.
+	return 'name reserved by static.conf' if $reserved_name{(split /\./, $name)[-1]};
+	return 'duplicate name' if $seen_name{$name}++;
+	return undef;
+}
+
+for my $r (@items) {
+	my $name = $r->{name} // '';
+	my $ip   = $r->{ipv4} // '';
+	my $why = $ip !~ $IPV4_RE ? 'invalid IPv4' : name_problem($name);
+	if ($why) {
+		push @skips, "skipping record $r->{id} ($name -> $ip): $why";
+		next;
+	}
+	$ip_of{$r->{id}} = $ip;
+	push @a, sprintf('local-data: "%s.%s. %d IN A %s"', $name, $DOMAIN, $TTL, $ip);
+	next if $r->{no_ptr} || $reserved_ptr{$ip} || $seen_ptr{$ip}++;
+	$ptr_name{$r->{id}} = $name;
+	push @ptr_ids, $r->{id};
+}
+
+# An alias gets its target's address while the target is served. It has no PTR
+# of its own; with takes_ptr it gives its name to the target's (D36).
+for my $r (@aliases) {
+	my $name   = $r->{name} // '';
+	my $target = $r->{alias_of} // '';
+	my $ip     = $ip_of{$target};
+	my $why = $target eq '' ? 'alias target was deleted'
+	    : !defined $ip ? 'alias target not served'
+	    : name_problem($name);
+	if ($why) {
+		push @skips, "skipping alias $r->{id} ($name): $why";
+		next;
+	}
+	push @a, sprintf('local-data: "%s.%s. %d IN A %s"', $name, $DOMAIN, $TTL, $ip);
+	next unless $r->{takes_ptr} && exists $ptr_name{$target};
+	if ($ptr_by{$target}) {	# PocketBase allows only one; keep the first by name
+		push @skips, "alias $r->{id} ($name): takes_ptr ignored, $ptr_by{$target} already takes the PTR";
+		next;
+	}
+	$ptr_by{$target} = $ptr_name{$target} = $name;
+}
+my @ptr = map { sprintf('local-data-ptr: "%s %d %s.%s"', $ip_of{$_}, $TTL, $ptr_name{$_}, $DOMAIN) } @ptr_ids;
+
+my $content = join("\n",
+    '# Generated by dnssync from PocketBase -- do not edit.', @a, @ptr) . "\n";
+
+my $current = slurp($OUT) // '';
+if ($content eq $current) {
+	closelog();
+	exit 0;
+}
+
+# --- install, validate, reload (roll back if Unbound rejects the config)
+open(my $fh, '>', $TMP) or fail("cannot write $TMP: $!");
+print $fh $content;
+close($fh) or fail("cannot write $TMP: $!");
+
+if (-e $OUT) {
+	open(my $in, '<', $OUT) and open(my $bk, '>', $PREV) or fail("cannot back up $OUT: $!");
+	print $bk do { local $/; <$in> };
+	close($bk);
+	close($in);
+}
+rename($TMP, $OUT) or fail("cannot install $OUT: $!");
+
+if (run_quiet('/usr/sbin/unbound-checkconf') != 0) {
+	if (-e $PREV) {
+		rename($PREV, $OUT);
+	} elsif (open(my $empty, '>', $OUT)) {
+		print $empty "# Generated by dnssync from PocketBase -- do not edit.\n";
+		close($empty);
+	}
+	fail('unbound-checkconf rejected the generated file; restored previous version');
+}
+if (run_quiet('/usr/sbin/unbound-control', 'reload_keep_cache') != 0) {
+	fail('unbound-control reload_keep_cache failed');
+}
+
+logmsg('warning', $_) for @skips;
+logmsg('info', sprintf('updated %s: %d A, %d PTR, %d skipped', $OUT, scalar @a, scalar @ptr, scalar @skips));
+closelog();
+exit 0;

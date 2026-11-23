@@ -1,0 +1,21 @@
+#!/usr/bin/expect -f
+# Run a remote command under doas, answering the password prompt.
+# usage: rdoas.exp <passfile> <user@host> <remote command>
+set timeout 900
+set passfile [lindex $argv 0]
+set host     [lindex $argv 1]
+set cmd      [lindex $argv 2]
+
+set f [open $passfile r]
+set pass [string trimright [read $f] "\n"]
+close $f
+
+log_user 1
+spawn -noecho ssh -tt -o BatchMode=yes $host "doas $cmd"
+expect {
+    -re {password:\s*$} { log_user 0; send -- "$pass\r"; expect "\n"; log_user 1; exp_continue }
+    "Authentication failed" { exit 2 }
+    eof
+}
+catch wait result
+exit [lindex $result 3]

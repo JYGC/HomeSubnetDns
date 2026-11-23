@@ -1,0 +1,2 @@
+inet @ADDRESS@ @NETMASK@
+inet6 autoconf

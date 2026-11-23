@@ -1,0 +1,2 @@
+# _dnssync crontab: sync PocketBase hosts into Unbound every minute.
+* * * * * /usr/local/libexec/dnssync

@@ -1,0 +1,14 @@
+# This site's settings and notes: copy site.conf.example to site.conf
+site.conf
+CLAUDE.local.md
+
+# local secrets / build output
+*.pass
+.pbcreds
+pocketbase/pocketbase
+
+# local screenshots and notes; they may hold device identifiers
+resources/
+
+# PocketBase backups (scripts/backup): every record and the password hashes
+homesubnetdns-*.tgz*

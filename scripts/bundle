@@ -1,0 +1,55 @@
+#!/bin/sh
+# Make a self-contained installer for the DNS box: jobs/23-install-box.sh, the
+# PocketBase build and the config files with site.conf filled in, in one file.
+# Copy it to a fresh OpenBSD box and run it there, with no workstation needed
+# (RUNBOOK.md §5). It holds no secrets; pair it with a scripts/backup file to
+# bring the data back. scripts/backup refreshes it.
+# usage: scripts/bundle [OUT]   (default: homesubnetdns-installer.tgz in
+#                                $HSD_BACKUP_DIR, ~/.local/share/homesubnetdns/backups)
+set -eu
+
+DIR=${HSD_BACKUP_DIR:-$HOME/.local/share/homesubnetdns/backups}
+out=${1:-$DIR/homesubnetdns-installer.tgz}
+case $out in /*) ;; *) out=$PWD/$out ;; esac
+cd "$(dirname "$0")/.."
+
+scripts/build
+t=$(mktemp -d)
+trap 'rm -rf "$t"' EXIT
+B=$t/install-box
+mkdir -p "$B"
+scripts/stage --to "$B/files"
+cp jobs/23-install-box.sh "$B/install.sh"
+
+rev=$(git rev-parse --short HEAD)
+[ -z "$(git status --porcelain)" ] || rev="$rev plus uncommitted changes"
+domain=$(sed -n 's/^DOMAIN=//p' site.conf)
+address=$(sed -n 's/^ADDRESS=//p' site.conf)
+cat >"$B/README.txt" <<EOF
+HomeSubnetDns installer, built $(date -u '+%Y-%m-%d %H:%M UTC') from commit $rev, DOMAIN=$domain ADDRESS=$address
+Sets up a fresh OpenBSD 8.0 amd64 install as the DNS and DHCP box,
+dns.$domain at $address, or brings an installed box up to date (it changes
+only what differs). RUNBOOK.md §5 in the repo has the full steps. The rest of
+the network (netmask, gateway, DHCP pool) is read from the box's LAN interface.
+
+1. Install OpenBSD with hostname dns and a user in group wheel, on the LAN by
+   DHCP, or with a static address and default route. If doas has no
+   config, as root: echo 'permit persist keepenv :wheel' > /etc/doas.conf
+2. Copy this file, and the newest backup (homesubnetdns-YYYYmmdd-HHMMSS.tgz)
+   if you have one, to the box: scp, or a USB stick (dmesg shows its disk,
+   e.g. sd1; then mount_msdos /dev/sd1i /mnt).
+3. As that user, in a path without spaces:
+     tar xzf homesubnetdns-installer.tgz
+     doas sh install-box/install.sh --restore /path/to/the-backup.tgz
+   Leave out --restore to start with an empty database.
+4. Run it again until it says it's done. It tells you when: after the
+   address switch (within 3 minutes), after a kernel patch (reboot first),
+   and to add --start-dhcpd, but only once the router's DHCP server is off
+   and the old box is down. --check only reports. If it can't tell the
+   router's address, add --gateway with it.
+EOF
+
+mkdir -p "$(dirname "$out")"
+(cd "$t" && tar --format=ustar -czf "$out.part" install-box)
+mv "$out.part" "$out"
+echo "bundle: $out ($(du -h "$out" | cut -f1)), commit $rev"

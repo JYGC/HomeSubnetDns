@@ -1,0 +1,54 @@
+#!/bin/sh
+# Set up the DNS box from scratch, or rebuild it in place of a lost one
+# (RUNBOOK.md §5): build PocketBase, stage the files, upload the backup, then
+# run jobs/23-install-box.sh on the box as root. Run it again until it says
+# it's done: every step is skipped once it's in place. To run the installer
+# on the box itself instead, see scripts/bundle.
+# It is also how every later change reaches the box: a new ADDRESS or DOMAIN
+# in site.conf, config files, dnssync, PocketBase (RUNBOOK §3, §8).
+# usage: scripts/install-box [--check] [--restore BACKUP] [--start-dhcpd]
+#                            [--interface IF] [--gateway IP]
+#   --check        only report what would change; safe on the running box
+#   --restore      a file from scripts/backup
+#   --start-dhcpd  the router's DHCP server is off and the old box is down
+#   --interface    the box's LAN interface, if it can't tell
+#   --gateway      the LAN's router, if it can't tell (no default route yet)
+# Environment: RDOAS_PASSFILE (RUNBOOK §4); RDOAS_HOST, default
+# BOX_USER@ADDRESS (site.conf). Set it to the box's current address while the
+# installer moves the box to a new ADDRESS.
+set -eu
+
+cd "$(dirname "$0")/.."
+HOST=$(scripts/box-host)
+usage() {
+	echo "usage: scripts/install-box [--check] [--restore BACKUP] [--start-dhcpd] [--interface IF] [--gateway IP]" >&2
+	exit 2
+}
+args= backup=
+while [ $# -gt 0 ]; do
+	case $1 in
+	--check | --start-dhcpd) args="$args $1" ;;
+	--interface | --gateway)
+		[ $# -ge 2 ] || usage
+		case $2 in '' | *[!a-z0-9.]*) usage ;; esac
+		args="$args $1 $2"
+		shift
+		;;
+	--restore) [ $# -ge 2 ] || usage; backup=$2; shift ;;
+	*) usage ;;
+	esac
+	shift
+done
+: "${RDOAS_PASSFILE:?set RDOAS_PASSFILE to the doas password file (RUNBOOK.md §4)}"
+if [ -n "$backup" ]; then
+	tar -tzf "$backup" 2>/dev/null | grep -qx 'pb_data/data.db' ||
+		{ echo "$backup isn't a file from scripts/backup" >&2; exit 1; }
+fi
+
+scripts/build
+scripts/stage
+if [ -n "$backup" ]; then
+	scp -q -o BatchMode=yes "$backup" "$HOST:.rdoas/stage/restore.tgz"
+	args="$args --restore .rdoas/stage/restore.tgz"	# from the login directory, where the job runs
+fi
+exec scripts/rdoas jobs/23-install-box.sh $args

@@ -1,0 +1,23 @@
+# Site settings. Copy this file to site.conf, which git ignores, and fill it
+# in. Plain NAME=value lines; no quotes, no spaces. The installer
+# (scripts/install-box, or a scripts/bundle file on the box) applies them:
+# change one, run scripts/install-box --check to see what it changes, then run
+# it without --check (RUNBOOK.md §3).
+
+# The zone host names are served in: <name>.<DOMAIN>. home.arpa is the name
+# reserved for home networks (RFC 8375).
+DOMAIN=home.arpa
+
+# The box's address on the LAN (192.0.2.53 is a documentation address: pick an
+# unused one on your LAN, outside the router's DHCP pool). Nothing else about
+# the network is set here: the installer reads the netmask and the gateway from
+# the box's LAN interface, and works out the subnet, the DHCP pool and the
+# reverse zone from them (D41). Changing it moves the box (D42); then re-run
+# install.sh on each device with --box and the new address (RUNBOOK §8a). The
+# workstation scripts reach the box here too, unless RDOAS_HOST says otherwise.
+ADDRESS=192.0.2.53
+
+# The user the workstation scripts log in to the box as over SSH, a member of
+# group wheel so it can use doas. Leave it empty to use ~/.ssh/config, or your
+# local user name. Only the workstation scripts use it.
+BOX_USER=

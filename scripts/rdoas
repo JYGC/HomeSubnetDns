@@ -1,0 +1,17 @@
+#!/bin/sh
+# Copy a local shell script to the DNS host and run it as root via doas.
+# usage: RDOAS_PASSFILE=/path/to/pass scripts/rdoas <script.sh> [args...]
+# The args reach the script as words split by the remote shell; keep them plain.
+# The box is BOX_USER@ADDRESS (site.conf), unless RDOAS_HOST says otherwise.
+set -eu
+
+here=$(dirname "$0")
+HOST=$("$here/box-host")
+: "${RDOAS_PASSFILE:?set RDOAS_PASSFILE to a mode-0600 file holding the doas password}"
+script=$1
+shift
+
+remote=".rdoas/$(basename "$script")"
+ssh -o BatchMode=yes "$HOST" 'mkdir -p -m 700 .rdoas'
+scp -q -o BatchMode=yes "$script" "$HOST:$remote"
+exec expect -f "$here/rdoas.exp" "$RDOAS_PASSFILE" "$HOST" "sh $remote $*"

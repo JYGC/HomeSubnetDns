@@ -1,0 +1,17 @@
+#!/bin/ksh
+#
+# PocketBase (HomeSubnetDns host records). Deployed to /etc/rc.d/pocketbase;
+# the installer fills in the placeholders from site.conf and the box's LAN interface:
+# --lan is this box's address and the LAN's prefix length (D41).
+
+daemon="/usr/local/bin/pocketbase"
+daemon_flags="serve --http=@ADDRESS@:8090 --dir=/var/pocketbase/pb_data --dns-domain=@DOMAIN@ --lan=@ADDRESS@/@BITS@ --gateway=@GATEWAY@"
+daemon_user="_pocketbase"
+daemon_logger="daemon.info"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_cmd $1

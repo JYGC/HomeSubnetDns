@@ -1,0 +1,10 @@
+#!/bin/sh
+# Test PocketBase, then build it for the box (OpenBSD amd64) as
+# pocketbase/pocketbase. -buildvcs=false: the same source gives the same
+# binary, so the installer only restarts PocketBase for real changes.
+# usage: scripts/build
+set -eu
+
+cd "$(dirname "$0")/../pocketbase"
+go test ./...
+CGO_ENABLED=0 GOOS=openbsd GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags "-s -w" -o pocketbase .

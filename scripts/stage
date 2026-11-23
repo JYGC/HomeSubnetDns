@@ -1,0 +1,45 @@
+#!/bin/sh
+# Copy every deployable file to the DNS box's staging dir (~/.rdoas/stage),
+# under the names the installer (jobs/23-install-box.sh) expects. The files
+# are templates: the installer fills in their @NAME@ placeholders on the box,
+# from site.conf (copied with them) and from the box's LAN interface (D41).
+# Build PocketBase first (scripts/build).
+# usage: scripts/stage [--to DIR]
+#   --to  write the files into DIR on this machine instead (scripts/bundle)
+set -eu
+
+cd "$(dirname "$0")/.."
+to=
+case ${1-} in
+'') ;;
+--to) [ $# -eq 2 ] || { echo "usage: scripts/stage [--to DIR]" >&2; exit 2; }; to=$2 ;;
+*) echo "usage: scripts/stage [--to DIR]" >&2; exit 2 ;;
+esac
+[ -x pocketbase/pocketbase ] || { echo "pocketbase/pocketbase missing: run scripts/build first" >&2; exit 1; }
+
+HOST=$(scripts/box-host)	# also checks that there's a site.conf
+DOMAIN=$(sed -n 's/^DOMAIN=//p' site.conf)
+ADDRESS=$(sed -n 's/^ADDRESS=//p' site.conf)
+label='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+echo "$DOMAIN" | grep -Eqx "$label(\.$label)*" && [ ${#DOMAIN} -le 251 ] ||
+	{ echo "site.conf: DOMAIN must be a lowercase domain name, e.g. home.arpa" >&2; exit 1; }
+octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+echo "$ADDRESS" | grep -Eqx "($octet\.){3}$octet" ||
+	{ echo "site.conf: ADDRESS must be the box's IPv4 address, e.g. 192.0.2.53" >&2; exit 1; }
+
+t=$(mktemp -d)
+trap 'rm -rf "$t"' EXIT
+cp net/hostname.if net/mygate jobs/netswitch.sh pf/pf.conf pocketbase/pocketbase site.conf "$t"/
+cp unbound/unbound.conf unbound/static.conf dhcpd/dhcpd.conf dnssync/dnssync "$t"/
+cp pocketbase/rc.d/pocketbase "$t"/rc.d.pocketbase
+cp dnssync/crontab "$t"/dnssync.crontab
+
+if [ -n "$to" ]; then
+	mkdir -p "$to"
+	cp "$t"/* "$to"/
+	echo "copied into $to (DOMAIN=$DOMAIN ADDRESS=$ADDRESS)"
+	exit 0
+fi
+ssh -o BatchMode=yes "$HOST" 'mkdir -p -m 700 .rdoas/stage && rm -f .rdoas/stage/*'
+scp -q -o BatchMode=yes "$t"/* "$HOST:.rdoas/stage/"
+echo "staged to $HOST:.rdoas/stage (DOMAIN=$DOMAIN ADDRESS=$ADDRESS): $(ls "$t" | tr '\n' ' ')"
